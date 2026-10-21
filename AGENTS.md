@@ -1,6 +1,8 @@
 ## Regulation
 
 - Grok Bot / Cursor Cloud Agents で開発する
+- Rust を用いる
+- AWS を用いる　S3/DynamoDB/SQS/EC2 あたり　IaC をする
 
 ## Tasks
 
