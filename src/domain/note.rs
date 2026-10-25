@@ -1,6 +1,5 @@
 use std::future::Future;
 
-use anyhow::Error as AnyhowError;
 use uuid::Uuid;
 
 /// Validated note text. Empty input never becomes a [`Note`].
@@ -25,15 +24,37 @@ impl NoteText {
     }
 }
 
+/// Identity of one note. Distinct from any other `Uuid` in the process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NoteId(Uuid);
+
+impl NoteId {
+    pub fn generate() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl From<Uuid> for NoteId {
+    fn from(id: Uuid) -> Self {
+        Self(id)
+    }
+}
+
+impl From<NoteId> for Uuid {
+    fn from(id: NoteId) -> Self {
+        id.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Note {
-    id: Uuid,
+    id: NoteId,
     text: NoteText,
     completed: bool,
 }
 
 impl Note {
-    pub fn from_stored(id: Uuid, text: NoteText, completed: bool) -> Self {
+    pub fn new(id: NoteId, text: NoteText, completed: bool) -> Self {
         Self {
             id,
             text,
@@ -41,7 +62,7 @@ impl Note {
         }
     }
 
-    pub fn id(&self) -> Uuid {
+    pub fn id(&self) -> NoteId {
         self.id
     }
 
@@ -55,73 +76,46 @@ impl Note {
 }
 
 #[derive(Debug)]
-pub enum CreateNoteError {
-    Unknown(AnyhowError),
-}
-
-#[derive(Debug)]
-pub enum ListNotesError {
-    Unknown(AnyhowError),
-}
-
-#[derive(Debug)]
-pub enum UpdateNoteError {
-    NotFound,
-    Unknown(AnyhowError),
-}
-
-#[derive(Debug)]
-pub enum DeleteNoteError {
-    NotFound,
-    Unknown(AnyhowError),
-}
+pub struct NoteNotFound;
 
 pub trait NoteRepository: Clone + Send + Sync + 'static {
-    fn create(
-        &self,
-        owner: &str,
-        text: &NoteText,
-    ) -> impl Future<Output = Result<Note, CreateNoteError>> + Send;
+    fn create(&self, owner: &str, text: &NoteText) -> impl Future<Output = Note> + Send;
 
-    fn list(&self, owner: &str) -> impl Future<Output = Result<Vec<Note>, ListNotesError>> + Send;
+    fn list(&self, owner: &str) -> impl Future<Output = Vec<Note>> + Send;
 
     fn update(
         &self,
         owner: &str,
-        id: Uuid,
+        id: NoteId,
         text: Option<&NoteText>,
         completed: Option<bool>,
-    ) -> impl Future<Output = Result<Note, UpdateNoteError>> + Send;
+    ) -> impl Future<Output = Result<Note, NoteNotFound>> + Send;
 
     fn delete(
         &self,
         owner: &str,
-        id: Uuid,
-    ) -> impl Future<Output = Result<(), DeleteNoteError>> + Send;
+        id: NoteId,
+    ) -> impl Future<Output = Result<(), NoteNotFound>> + Send;
 }
 
 pub trait NoteService: Clone + Send + Sync + 'static {
-    fn create(
-        &self,
-        owner: &str,
-        text: &NoteText,
-    ) -> impl Future<Output = Result<Note, CreateNoteError>> + Send;
+    fn create(&self, owner: &str, text: &NoteText) -> impl Future<Output = Note> + Send;
 
-    fn list(&self, owner: &str) -> impl Future<Output = Result<Vec<Note>, ListNotesError>> + Send;
+    fn list(&self, owner: &str) -> impl Future<Output = Vec<Note>> + Send;
 
     fn update(
         &self,
         owner: &str,
-        id: Uuid,
+        id: NoteId,
         text: Option<&NoteText>,
         completed: Option<bool>,
-    ) -> impl Future<Output = Result<Note, UpdateNoteError>> + Send;
+    ) -> impl Future<Output = Result<Note, NoteNotFound>> + Send;
 
     fn delete(
         &self,
         owner: &str,
-        id: Uuid,
-    ) -> impl Future<Output = Result<(), DeleteNoteError>> + Send;
+        id: NoteId,
+    ) -> impl Future<Output = Result<(), NoteNotFound>> + Send;
 }
 
 #[derive(Debug, Clone)]
@@ -139,25 +133,25 @@ impl<R> NoteService for Service<R>
 where
     R: NoteRepository,
 {
-    async fn create(&self, owner: &str, text: &NoteText) -> Result<Note, CreateNoteError> {
+    async fn create(&self, owner: &str, text: &NoteText) -> Note {
         self.repo.create(owner, text).await
     }
 
-    async fn list(&self, owner: &str) -> Result<Vec<Note>, ListNotesError> {
+    async fn list(&self, owner: &str) -> Vec<Note> {
         self.repo.list(owner).await
     }
 
     async fn update(
         &self,
         owner: &str,
-        id: Uuid,
+        id: NoteId,
         text: Option<&NoteText>,
         completed: Option<bool>,
-    ) -> Result<Note, UpdateNoteError> {
+    ) -> Result<Note, NoteNotFound> {
         self.repo.update(owner, id, text, completed).await
     }
 
-    async fn delete(&self, owner: &str, id: Uuid) -> Result<(), DeleteNoteError> {
+    async fn delete(&self, owner: &str, id: NoteId) -> Result<(), NoteNotFound> {
         self.repo.delete(owner, id).await
     }
 }
@@ -170,5 +164,12 @@ mod tests {
     fn note_text_trims_and_rejects_blank() {
         assert_eq!(NoteText::new("  hello  ").unwrap().as_str(), "hello");
         assert!(NoteText::new("   ").is_err());
+    }
+
+    #[test]
+    fn note_id_is_its_own_uuid() {
+        let id = NoteId::generate();
+        let raw = Uuid::from(id);
+        assert_eq!(NoteId::from(raw), id);
     }
 }
