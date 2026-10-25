@@ -1,15 +1,13 @@
 use std::future::Future;
 
 use anyhow::Error as AnyhowError;
-use thiserror::Error;
 use uuid::Uuid;
 
 /// Validated note text. Empty input never becomes a [`Note`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoteText(String);
 
-#[derive(Clone, Debug, PartialEq, Eq, Error)]
-#[error("note text cannot be empty")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoteTextEmptyError;
 
 impl NoteText {
@@ -56,32 +54,26 @@ impl Note {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum CreateNoteError {
-    #[error("note store failed")]
-    Unknown(#[source] AnyhowError),
+    Unknown(AnyhowError),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum ListNotesError {
-    #[error("note store failed")]
-    Unknown(#[source] AnyhowError),
+    Unknown(AnyhowError),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum UpdateNoteError {
-    #[error("note not found")]
     NotFound,
-    #[error("note store failed")]
-    Unknown(#[source] AnyhowError),
+    Unknown(AnyhowError),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum DeleteNoteError {
-    #[error("note not found")]
     NotFound,
-    #[error("note store failed")]
-    Unknown(#[source] AnyhowError),
+    Unknown(AnyhowError),
 }
 
 pub trait NoteRepository: Clone + Send + Sync + 'static {

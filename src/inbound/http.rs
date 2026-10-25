@@ -405,11 +405,10 @@ async fn notes_index(
     Query(pagination): Query<Pagination>,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<NoteResponse>>, StatusCode> {
-    let notes = state
-        .notes
-        .list(&user.id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let notes = state.notes.list(&user.id).await.map_err(|err| {
+        tracing::error!("{err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let notes = notes
         .into_iter()
         .skip(pagination.offset.unwrap_or(0))
@@ -425,11 +424,10 @@ async fn notes_create(
     Json(input): Json<CreateNote>,
 ) -> Result<(StatusCode, Json<NoteResponse>), StatusCode> {
     let text = NoteText::new(&input.text).map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
-    let note = state
-        .notes
-        .create(&user.id, &text)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let note = state.notes.create(&user.id, &text).await.map_err(|err| {
+        tracing::error!("{err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     Ok((StatusCode::CREATED, Json(note.into())))
 }
 
@@ -451,7 +449,10 @@ async fn notes_update(
         .await
         .map_err(|err| match err {
             UpdateNoteError::NotFound => StatusCode::NOT_FOUND,
-            UpdateNoteError::Unknown(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            UpdateNoteError::Unknown(cause) => {
+                tracing::error!("{cause:?}\n{cause}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         })?;
     Ok(Json(note.into()))
 }
@@ -467,7 +468,10 @@ async fn notes_delete(
         .await
         .map_err(|err| match err {
             DeleteNoteError::NotFound => StatusCode::NOT_FOUND,
-            DeleteNoteError::Unknown(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            DeleteNoteError::Unknown(cause) => {
+                tracing::error!("{cause:?}\n{cause}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         })?;
     Ok(StatusCode::NO_CONTENT)
 }
