@@ -51,3 +51,6 @@ terraform -chdir=infra init -input=false
 terraform -chdir=infra apply -input=false -auto-approve -var-file=ministack.tfvars
 "$probe_venv/bin/python" scripts/check_ministack.py
 terraform -chdir=infra plan -input=false -detailed-exitcode -var-file=ministack.tfvars
+
+cargo test
+MINISTACK_ENDPOINT=http://127.0.0.1:4566 cargo test -- --ignored ministack_notes_follow_the_login_flow
