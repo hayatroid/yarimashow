@@ -22,3 +22,8 @@
 ## Cursor Cloud specific instructions
 
 Terraform は `infra/`。アプリは Rust の `domain` / `inbound` / `outbound`。実 AWS に当てる前に MiniStack（`http://127.0.0.1:4566`）へ `./scripts/verify-infra.sh` を流す。接続先は `infra/ministack.tfvars`。メモの DynamoDB は `NOTES_BACKEND=dynamodb` と `AWS_ENDPOINT_URL`。traQ の `CLIENT_ID` / `CLIENT_SECRET` と実 AWS の秘密情報は Cursor の Secrets に置く。
+
+## Git
+
+To open a PR, spawn a fresh subagent whose entire prompt is `/pr`.
+
