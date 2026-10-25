@@ -1,82 +1,98 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use uuid::Uuid;
 
-use crate::domain::auth::{AuthError, SessionRecord, Sessions};
-use crate::domain::note::{CreateNoteError, ListNotesError, Note, NoteRepository};
-use crate::domain::user::UserId;
+use crate::domain::note::{
+    CreateNoteError, DeleteNoteError, ListNotesError, Note, NoteRepository, NoteText,
+    UpdateNoteError,
+};
 
+/// The in-memory map from the axum todos example, behind [`NoteRepository`].
 #[derive(Clone, Default)]
 pub struct MemoryNotes {
-    notes: Arc<Mutex<Vec<Note>>>,
+    notes: Arc<RwLock<HashMap<Uuid, Record>>>,
+}
+
+#[derive(Clone)]
+struct Record {
+    owner: String,
+    text: NoteText,
+    completed: bool,
 }
 
 impl MemoryNotes {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn read(&self) -> Result<std::sync::RwLockReadGuard<'_, HashMap<Uuid, Record>>, anyhow::Error> {
+        self.notes
+            .read()
+            .map_err(|_| anyhow::anyhow!("note store lock poisoned"))
+    }
+
+    fn write(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, HashMap<Uuid, Record>>, anyhow::Error> {
+        self.notes
+            .write()
+            .map_err(|_| anyhow::anyhow!("note store lock poisoned"))
+    }
 }
 
 impl NoteRepository for MemoryNotes {
-    async fn insert(&self, note: &Note) -> Result<(), CreateNoteError> {
-        let mut notes = self
-            .notes
-            .lock()
-            .map_err(|_| CreateNoteError::Unknown(anyhow::anyhow!("note store lock poisoned")))?;
-        notes.push(note.clone());
-        Ok(())
+    async fn create(&self, owner: &str, text: &NoteText) -> Result<Note, CreateNoteError> {
+        let mut notes = self.write().map_err(CreateNoteError::Unknown)?;
+        let id = Uuid::new_v4();
+        notes.insert(
+            id,
+            Record {
+                owner: owner.to_string(),
+                text: text.clone(),
+                completed: false,
+            },
+        );
+        Ok(Note::from_stored(id, text.clone(), false))
     }
 
-    async fn list_by_owner(&self, owner: &UserId) -> Result<Vec<Note>, ListNotesError> {
-        let notes = self
-            .notes
-            .lock()
-            .map_err(|_| ListNotesError::Unknown(anyhow::anyhow!("note store lock poisoned")))?;
+    async fn list(&self, owner: &str) -> Result<Vec<Note>, ListNotesError> {
+        let notes = self.read().map_err(ListNotesError::Unknown)?;
         Ok(notes
             .iter()
-            .filter(|note| note.owner() == owner)
-            .cloned()
+            .filter(|(_, record)| record.owner == owner)
+            .map(|(id, record)| Note::from_stored(*id, record.text.clone(), record.completed))
             .collect())
     }
-}
 
-#[derive(Clone, Default)]
-pub struct MemorySessions {
-    sessions: Arc<Mutex<HashMap<String, SessionRecord>>>,
-}
-
-impl MemorySessions {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl Sessions for MemorySessions {
-    async fn create(&self, record: SessionRecord) -> Result<String, AuthError> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| AuthError::Unknown(anyhow::anyhow!("session store lock poisoned")))?;
-        let id = Uuid::new_v4().to_string();
-        sessions.insert(id.clone(), record);
-        Ok(id)
+    async fn update(
+        &self,
+        owner: &str,
+        id: Uuid,
+        text: Option<&NoteText>,
+        completed: Option<bool>,
+    ) -> Result<Note, UpdateNoteError> {
+        let mut notes = self.write().map_err(UpdateNoteError::Unknown)?;
+        let Some(record) = notes.get_mut(&id).filter(|record| record.owner == owner) else {
+            return Err(UpdateNoteError::NotFound);
+        };
+        if let Some(text) = text {
+            record.text = text.clone();
+        }
+        if let Some(completed) = completed {
+            record.completed = completed;
+        }
+        Ok(Note::from_stored(id, record.text.clone(), record.completed))
     }
 
-    async fn load(&self, session_id: &str) -> Result<Option<SessionRecord>, AuthError> {
-        let sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| AuthError::Unknown(anyhow::anyhow!("session store lock poisoned")))?;
-        Ok(sessions.get(session_id).cloned())
-    }
-
-    async fn delete(&self, session_id: &str) -> Result<(), AuthError> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| AuthError::Unknown(anyhow::anyhow!("session store lock poisoned")))?;
-        sessions.remove(session_id);
-        Ok(())
+    async fn delete(&self, owner: &str, id: Uuid) -> Result<(), DeleteNoteError> {
+        let mut notes = self.write().map_err(DeleteNoteError::Unknown)?;
+        match notes.get(&id) {
+            Some(record) if record.owner == owner => {
+                notes.remove(&id);
+                Ok(())
+            }
+            _ => Err(DeleteNoteError::NotFound),
+        }
     }
 }

@@ -21,7 +21,7 @@
 
 ## Cursor Cloud specific instructions
 
-Terraform は `infra/`。アプリは Rust の `domain` / `inbound` / `outbound`。実 AWS に当てる前に MiniStack（`http://127.0.0.1:4566`）へ `./scripts/verify-infra.sh` を流す。接続先は `infra/ministack.tfvars`。メモの DynamoDB は `NOTES_BACKEND=dynamodb` と `AWS_ENDPOINT_URL`。traQ の `CLIENT_ID` / `CLIENT_SECRET` と実 AWS の秘密情報は Cursor の Secrets に置く。
+Terraform は `infra/`。アプリは axum の oauth と todos を、 hexagonal ガイドの `domain` / `inbound` / `outbound` でつないだもの。実 AWS に当てる前に MiniStack（`http://127.0.0.1:4566`）へ `./scripts/verify-infra.sh` を流す。接続先は `infra/ministack.tfvars`。traQ の `CLIENT_ID` / `CLIENT_SECRET` と実 AWS の秘密情報は Cursor の Secrets に置く。
 
 ## Git
 

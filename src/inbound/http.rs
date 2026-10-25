@@ -1,594 +1,629 @@
-use anyhow::Context;
-use axum::extract::{Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
+//! OAuth routes follow `axum/examples/oauth`. Note routes follow `axum/examples/todos`.
+//! `/auth/discord` is `/auth/traq`, and the authorize, token, and user URLs are traQ's.
 
-use crate::domain::auth::{AuthError, AuthService, SignedInUser};
-use crate::domain::note::{
-    CreateNoteError, ListNotesError, Note, NoteBody, NoteBodyError, NoteService,
+use std::convert::Infallible;
+use std::env;
+use std::time::Duration;
+
+use anyhow::{anyhow, Context};
+use async_session::{MemoryStore, Session, SessionStore};
+use axum::error_handling::HandleErrorLayer;
+use axum::extract::{FromRef, FromRequestParts, OptionalFromRequestParts, Path, Query, State};
+use axum::http::header::SET_COOKIE;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::{get, patch};
+use axum::{Json, RequestPartsExt, Router};
+use axum_extra::headers::Cookie;
+use axum_extra::typed_header::TypedHeaderRejectionReason;
+use axum_extra::TypedHeader;
+use http::header;
+use http::request::Parts;
+use oauth2::{
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet, EndpointSet,
+    RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
+use serde::{Deserialize, Serialize};
+use tower::BoxError;
+use tower::ServiceBuilder;
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use uuid::Uuid;
 
-#[derive(Clone, Debug)]
-pub struct HttpServerConfig {
-    pub port: u16,
-    pub cookie_secure: bool,
-}
+use crate::domain::note::{DeleteNoteError, Note, NoteService, NoteText, Service, UpdateNoteError};
+use crate::outbound::memory::MemoryNotes;
+
+const COOKIE_NAME: &str = "SESSION";
+const CSRF_TOKEN: &str = "csrf_token";
+const USERINFO_URL: &str = "https://q.trap.jp/api/v3/users/me";
+
+type BasicClient = oauth2::basic::BasicClient<
+    EndpointSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointSet,
+>;
+
+type Notes = Service<MemoryNotes>;
 
 #[derive(Clone)]
-struct AppState<N, A> {
-    notes: N,
-    auth: A,
-    cookie_secure: bool,
+struct AppState {
+    store: MemoryStore,
+    oauth_client: BasicClient,
+    notes: Notes,
 }
 
-pub struct HttpServer<N, A> {
-    state: AppState<N, A>,
-    port: u16,
-}
-
-impl<N, A> HttpServer<N, A>
-where
-    N: NoteService,
-    A: AuthService,
-{
-    pub fn new(notes: N, auth: A, config: HttpServerConfig) -> Self {
-        Self {
-            state: AppState {
-                notes,
-                auth,
-                cookie_secure: config.cookie_secure,
-            },
-            port: config.port,
-        }
-    }
-
-    pub fn router(&self) -> Router {
-        Router::new()
-            .route("/", get(index::<N, A>))
-            .route("/auth/traq", get(traq_auth::<N, A>))
-            .route("/auth/authorized", get(authorized::<N, A>))
-            .route("/logout", get(logout::<N, A>))
-            .route("/notes", get(list_notes::<N, A>).post(create_note::<N, A>))
-            .with_state(self.state.clone())
-    }
-
-    pub async fn run(self) -> anyhow::Result<()> {
-        let port = self.port;
-        let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
-            .await
-            .with_context(|| format!("failed to bind 0.0.0.0:{port}"))?;
-        tracing::info!("listening on {}", listener.local_addr()?);
-        axum::serve(listener, self.router())
-            .await
-            .context("http server stopped")?;
-        Ok(())
+impl FromRef<AppState> for MemoryStore {
+    fn from_ref(state: &AppState) -> Self {
+        state.store.clone()
     }
 }
 
-async fn index<N, A>(State(state): State<AppState<N, A>>, headers: HeaderMap) -> Response
-where
-    N: NoteService,
-    A: AuthService,
-{
-    let user = match signed_in_user(&state, &headers).await {
-        Ok(user) => user,
-        Err(err) => return err.into_response(),
-    };
-    Json(IndexBody {
-        user: user.as_ref().map(UserBody::from),
-    })
-    .into_response()
-}
-
-async fn traq_auth<N, A>(State(state): State<AppState<N, A>>) -> Result<Response, ApiError>
-where
-    N: NoteService,
-    A: AuthService,
-{
-    let start = state.auth.begin().await?;
-    let mut headers = session_cookie(start.session_id(), state.cookie_secure);
-    headers.insert(
-        header::LOCATION,
-        start.url().parse().map_err(|_| {
-            ApiError::Internal(anyhow::anyhow!("authorization url is not a valid header"))
-        })?,
-    );
-    Ok((StatusCode::SEE_OTHER, headers).into_response())
-}
-
-#[derive(Debug, Deserialize)]
-struct AuthQuery {
-    code: String,
-    state: String,
-}
-
-async fn authorized<N, A>(
-    State(state): State<AppState<N, A>>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-) -> Result<Response, ApiError>
-where
-    N: NoteService,
-    A: AuthService,
-{
-    let session_id = session_id(&headers).ok_or(ApiError::BadRequest("login was rejected"))?;
-    let completed = state
-        .auth
-        .complete(session_id, &query.code, &query.state)
-        .await?;
-    let mut headers = session_cookie(completed.session_id(), state.cookie_secure);
-    headers.insert(
-        header::LOCATION,
-        "/".parse().expect("root is a valid location"),
-    );
-    Ok((StatusCode::SEE_OTHER, headers).into_response())
-}
-
-async fn logout<N, A>(
-    State(state): State<AppState<N, A>>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError>
-where
-    N: NoteService,
-    A: AuthService,
-{
-    if let Some(session_id) = session_id(&headers) {
-        state.auth.logout(session_id).await?;
+impl FromRef<AppState> for BasicClient {
+    fn from_ref(state: &AppState) -> Self {
+        state.oauth_client.clone()
     }
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::SET_COOKIE,
-        "SESSION=; Max-Age=0; HttpOnly; Path=/; SameSite=Lax"
-            .parse()
-            .expect("clear cookie is valid"),
-    );
-    headers.insert(
-        header::LOCATION,
-        "/".parse().expect("root is a valid location"),
-    );
-    Ok((StatusCode::SEE_OTHER, headers).into_response())
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateNoteRequest {
-    body: String,
+pub async fn serve() -> anyhow::Result<()> {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| format!("{}=debug", env!("CARGO_CRATE_NAME")).into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to bind TcpListener: {err}"))?;
+    tracing::debug!("listening on {}", listener.local_addr()?);
+    axum::serve(listener, app(AppState::from_env()?)).await?;
+    Ok(())
 }
 
-async fn create_note<N, A>(
-    State(state): State<AppState<N, A>>,
-    headers: HeaderMap,
-    Json(request): Json<CreateNoteRequest>,
-) -> Result<(StatusCode, Json<NoteBodyResponse>), ApiError>
-where
-    N: NoteService,
-    A: AuthService,
-{
-    let user = require_user(&state, &headers).await?;
-    let body = NoteBody::new(&request.body).map_err(ApiError::from)?;
-    let note = state.notes.create(user.id(), &body).await?;
-    Ok((StatusCode::CREATED, Json(NoteBodyResponse::from(&note))))
-}
-
-async fn list_notes<N, A>(
-    State(state): State<AppState<N, A>>,
-    headers: HeaderMap,
-) -> Result<Json<NotesBody>, ApiError>
-where
-    N: NoteService,
-    A: AuthService,
-{
-    let user = require_user(&state, &headers).await?;
-    let notes = state.notes.list(user.id()).await?;
-    Ok(Json(NotesBody {
-        notes: notes.iter().map(NoteBodyResponse::from).collect(),
-    }))
-}
-
-async fn require_user<N, A>(
-    state: &AppState<N, A>,
-    headers: &HeaderMap,
-) -> Result<SignedInUser, ApiError>
-where
-    N: NoteService,
-    A: AuthService,
-{
-    signed_in_user(state, headers)
-        .await?
-        .ok_or(ApiError::Unauthorized)
-}
-
-async fn signed_in_user<N, A>(
-    state: &AppState<N, A>,
-    headers: &HeaderMap,
-) -> Result<Option<SignedInUser>, ApiError>
-where
-    N: NoteService,
-    A: AuthService,
-{
-    let Some(session_id) = session_id(headers) else {
-        return Ok(None);
-    };
-    state.auth.current(session_id).await.map_err(ApiError::from)
-}
-
-fn session_id(headers: &HeaderMap) -> Option<&str> {
-    let value = headers.get(header::COOKIE)?.to_str().ok()?;
-    value.split(';').find_map(|part| {
-        let (name, raw) = part.trim().split_once('=')?;
-        (name == "SESSION" && !raw.is_empty()).then_some(raw)
-    })
-}
-
-fn session_cookie(value: &str, secure: bool) -> HeaderMap {
-    let mut cookie = format!("SESSION={value}; SameSite=Lax; HttpOnly; Path=/");
-    if secure {
-        cookie.push_str("; Secure");
+impl AppState {
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            store: MemoryStore::new(),
+            oauth_client: oauth_client().map_err(|err| err.0)?,
+            notes: Service::new(MemoryNotes::new()),
+        })
     }
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::SET_COOKIE,
-        cookie.parse().expect("session cookie is valid"),
-    );
-    headers
 }
 
-#[derive(Serialize)]
-struct IndexBody {
-    user: Option<UserBody>,
+fn oauth_client() -> Result<BasicClient, AppError> {
+    let client_id = env::var("CLIENT_ID").context("Missing CLIENT_ID!")?;
+    let client_secret = env::var("CLIENT_SECRET").context("Missing CLIENT_SECRET!")?;
+    let redirect_url = env::var("REDIRECT_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3000/auth/authorized".to_string());
+    let auth_url = env::var("AUTH_URL").unwrap_or_else(|_| {
+        "https://q.trap.jp/api/v3/oauth2/authorize?response_type=code".to_string()
+    });
+    let token_url = env::var("TOKEN_URL")
+        .unwrap_or_else(|_| "https://q.trap.jp/api/v3/oauth2/token".to_string());
+
+    Ok(oauth2::basic::BasicClient::new(ClientId::new(client_id))
+        .set_client_secret(ClientSecret::new(client_secret))
+        .set_auth_uri(
+            AuthUrl::new(auth_url).context("failed to create new authorization server URL")?,
+        )
+        .set_token_uri(TokenUrl::new(token_url).context("failed to create new token endpoint URL")?)
+        .set_redirect_uri(
+            RedirectUrl::new(redirect_url).context("failed to create new redirection URL")?,
+        ))
 }
 
-#[derive(Serialize)]
-struct UserBody {
+fn app(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/auth/traq", get(traq_auth))
+        .route("/auth/authorized", get(login_authorized))
+        .route("/protected", get(protected))
+        .route("/logout", get(logout))
+        .route("/notes", get(notes_index).post(notes_create))
+        .route("/notes/{id}", patch(notes_update).delete(notes_delete))
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(|error: BoxError| async move {
+                    if error.is::<tower::timeout::error::Elapsed>() {
+                        Ok(StatusCode::REQUEST_TIMEOUT)
+                    } else {
+                        Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Unhandled internal error: {error}"),
+                        ))
+                    }
+                }))
+                .timeout(Duration::from_secs(10))
+                .layer(TraceLayer::new_for_http())
+                .into_inner(),
+        )
+        .with_state(state)
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct User {
     id: String,
     name: String,
 }
 
-impl From<&SignedInUser> for UserBody {
-    fn from(user: &SignedInUser) -> Self {
-        Self {
-            id: user.id().as_str().to_string(),
-            name: user.name().as_str().to_string(),
-        }
+async fn index(user: Option<User>) -> impl IntoResponse {
+    match user {
+        Some(user) => format!(
+            "Hey {}! You're logged in!\nYou may now access `/notes`.\nLog out with `/logout`.",
+            user.name
+        ),
+        None => "You're not logged in.\nVisit `/auth/traq` to do so.".to_string(),
     }
 }
 
-#[derive(Serialize)]
-struct NotesBody {
-    notes: Vec<NoteBodyResponse>,
+async fn traq_auth(
+    State(client): State<BasicClient>,
+    State(store): State<MemoryStore>,
+) -> Result<(HeaderMap, Redirect), AppError> {
+    let (auth_url, csrf_token) = client
+        .authorize_url(CsrfToken::new_random)
+        .add_scope(Scope::new("read".to_string()))
+        .url();
+
+    let mut session = Session::new();
+    session
+        .insert(CSRF_TOKEN, &csrf_token)
+        .context("failed in inserting CSRF token into session")?;
+    let cookie = store
+        .store_session(session)
+        .await
+        .context("failed to store CSRF token session")?
+        .context("unexpected error retrieving CSRF cookie value")?;
+    let mut headers = HeaderMap::new();
+    let cookie = format!("{COOKIE_NAME}={cookie}; SameSite=Lax; HttpOnly; Secure; Path=/");
+    headers.insert(
+        SET_COOKIE,
+        cookie.parse().context("failed to parse cookie")?,
+    );
+    Ok((headers, Redirect::to(auth_url.as_str())))
 }
 
-#[derive(Serialize)]
-struct NoteBodyResponse {
-    id: String,
-    body: String,
-    created_at_ms: i64,
+async fn protected(user: User) -> impl IntoResponse {
+    format!("Welcome to the protected area :)\nHere's your info:\n{user:?}")
 }
 
-impl From<&Note> for NoteBodyResponse {
-    fn from(note: &Note) -> Self {
-        Self {
-            id: note.id().to_string(),
-            body: note.body().as_str().to_string(),
-            created_at_ms: note.created_at_ms(),
-        }
+async fn logout(
+    State(store): State<MemoryStore>,
+    TypedHeader(cookies): TypedHeader<Cookie>,
+) -> Result<Redirect, AppError> {
+    let cookie = cookies
+        .get(COOKIE_NAME)
+        .context("unexpected error getting cookie name")?;
+    let session = match store
+        .load_session(cookie.to_string())
+        .await
+        .context("failed to load session")?
+    {
+        Some(session) => session,
+        None => return Ok(Redirect::to("/")),
+    };
+    store
+        .destroy_session(session)
+        .await
+        .context("failed to destroy session")?;
+    Ok(Redirect::to("/"))
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthRequest {
+    code: String,
+    state: String,
+}
+
+async fn csrf_token_validation_workflow(
+    auth_request: &AuthRequest,
+    cookies: &Cookie,
+    store: &MemoryStore,
+) -> Result<(), AppError> {
+    let cookie = cookies
+        .get(COOKIE_NAME)
+        .context("unexpected error getting cookie name")?
+        .to_string();
+    let session = match store
+        .load_session(cookie)
+        .await
+        .context("failed to load session")?
+    {
+        Some(session) => session,
+        None => return Err(anyhow!("Session not found").into()),
+    };
+    let stored_csrf_token = session
+        .get::<CsrfToken>(CSRF_TOKEN)
+        .context("CSRF token not found in session")?
+        .to_owned();
+    store
+        .destroy_session(session)
+        .await
+        .context("Failed to destroy old session")?;
+    if *stored_csrf_token.secret() != auth_request.state {
+        return Err(anyhow!("CSRF token mismatch").into());
     }
+    Ok(())
 }
 
-enum ApiError {
-    BadRequest(&'static str),
-    Unauthorized,
-    Unprocessable(String),
-    Internal(anyhow::Error),
+async fn login_authorized(
+    Query(query): Query<AuthRequest>,
+    State(store): State<MemoryStore>,
+    State(oauth_client): State<BasicClient>,
+    TypedHeader(cookies): TypedHeader<Cookie>,
+) -> Result<(HeaderMap, Redirect), AppError> {
+    csrf_token_validation_workflow(&query, &cookies, &store).await?;
+
+    let client = reqwest::Client::new();
+    let token = oauth_client
+        .exchange_code(AuthorizationCode::new(query.code))
+        .request_async(&client)
+        .await
+        .context("failed in sending request to authorization server")?;
+    let user = client
+        .get(USERINFO_URL)
+        .bearer_auth(token.access_token().secret())
+        .send()
+        .await
+        .context("failed in sending request to target Url")?
+        .json::<User>()
+        .await
+        .context("failed to deserialize response as JSON")?;
+
+    let mut session = Session::new();
+    session
+        .insert("user", &user)
+        .context("failed in inserting serialized value into session")?;
+    let cookie = store
+        .store_session(session)
+        .await
+        .context("failed to store session")?
+        .context("unexpected error retrieving cookie value")?;
+    let mut headers = HeaderMap::new();
+    let cookie = format!("{COOKIE_NAME}={cookie}; SameSite=Lax; HttpOnly; Secure; Path=/");
+    headers.insert(
+        SET_COOKIE,
+        cookie.parse().context("failed to parse cookie")?,
+    );
+    Ok((headers, Redirect::to("/")))
 }
 
-impl From<AuthError> for ApiError {
-    fn from(err: AuthError) -> Self {
-        match err {
-            AuthError::Rejected => Self::BadRequest("login was rejected"),
-            AuthError::Unknown(err) => Self::Internal(err),
-        }
-    }
-}
+struct AuthRedirect;
 
-impl From<NoteBodyError> for ApiError {
-    fn from(err: NoteBodyError) -> Self {
-        Self::Unprocessable(err.to_string())
-    }
-}
-
-impl From<CreateNoteError> for ApiError {
-    fn from(err: CreateNoteError) -> Self {
-        match err {
-            CreateNoteError::Unknown(err) => Self::Internal(err),
-        }
-    }
-}
-
-impl From<ListNotesError> for ApiError {
-    fn from(err: ListNotesError) -> Self {
-        match err {
-            ListNotesError::Unknown(err) => Self::Internal(err),
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
+impl IntoResponse for AuthRedirect {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message.to_string()),
-            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "login required".to_string()),
-            Self::Unprocessable(message) => (StatusCode::UNPROCESSABLE_ENTITY, message),
-            Self::Internal(err) => {
-                tracing::error!("{err:#}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "something went wrong".to_string(),
-                )
-            }
-        };
-        (status, Json(serde_json::json!({ "error": message }))).into_response()
+        Redirect::temporary("/auth/traq").into_response()
     }
+}
+
+impl<S> FromRequestParts<S> for User
+where
+    MemoryStore: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = AuthRedirect;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let store = MemoryStore::from_ref(state);
+        let cookies = parts
+            .extract::<TypedHeader<Cookie>>()
+            .await
+            .map_err(|err| match *err.name() {
+                header::COOKIE => match err.reason() {
+                    TypedHeaderRejectionReason::Missing => AuthRedirect,
+                    _ => panic!("unexpected error getting Cookie header(s): {err}"),
+                },
+                _ => panic!("unexpected error getting cookies: {err}"),
+            })?;
+        let session_cookie = cookies.get(COOKIE_NAME).ok_or(AuthRedirect)?;
+        let session = store
+            .load_session(session_cookie.to_string())
+            .await
+            .unwrap()
+            .ok_or(AuthRedirect)?;
+        session.get::<User>("user").ok_or(AuthRedirect)
+    }
+}
+
+impl<S> OptionalFromRequestParts<S> for User
+where
+    MemoryStore: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        match <User as FromRequestParts<S>>::from_request_parts(parts, state).await {
+            Ok(user) => Ok(Some(user)),
+            Err(AuthRedirect) => Ok(None),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AppError(anyhow::Error);
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        tracing::error!("Application error: {:#}", self.0);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong").into_response()
+    }
+}
+
+impl<E> From<E> for AppError
+where
+    E: Into<anyhow::Error>,
+{
+    fn from(err: E) -> Self {
+        Self(err.into())
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct Pagination {
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateNote {
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateNote {
+    text: Option<String>,
+    completed: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct NoteResponse {
+    id: Uuid,
+    text: String,
+    completed: bool,
+}
+
+impl From<Note> for NoteResponse {
+    fn from(note: Note) -> Self {
+        Self {
+            id: note.id(),
+            text: note.text().as_str().to_string(),
+            completed: note.completed(),
+        }
+    }
+}
+
+async fn notes_index(
+    user: User,
+    Query(pagination): Query<Pagination>,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<NoteResponse>>, StatusCode> {
+    let notes = state
+        .notes
+        .list(&user.id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let notes = notes
+        .into_iter()
+        .skip(pagination.offset.unwrap_or(0))
+        .take(pagination.limit.unwrap_or(usize::MAX))
+        .map(NoteResponse::from)
+        .collect();
+    Ok(Json(notes))
+}
+
+async fn notes_create(
+    user: User,
+    State(state): State<AppState>,
+    Json(input): Json<CreateNote>,
+) -> Result<(StatusCode, Json<NoteResponse>), StatusCode> {
+    let text = NoteText::new(&input.text).map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+    let note = state
+        .notes
+        .create(&user.id, &text)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((StatusCode::CREATED, Json(note.into())))
+}
+
+async fn notes_update(
+    user: User,
+    Path(id): Path<Uuid>,
+    State(state): State<AppState>,
+    Json(input): Json<UpdateNote>,
+) -> Result<Json<NoteResponse>, StatusCode> {
+    let text = input
+        .text
+        .as_deref()
+        .map(NoteText::new)
+        .transpose()
+        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+    let note = state
+        .notes
+        .update(&user.id, id, text.as_ref(), input.completed)
+        .await
+        .map_err(|err| match err {
+            UpdateNoteError::NotFound => StatusCode::NOT_FOUND,
+            UpdateNoteError::Unknown(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+    Ok(Json(note.into()))
+}
+
+async fn notes_delete(
+    user: User,
+    Path(id): Path<Uuid>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, StatusCode> {
+    state
+        .notes
+        .delete(&user.id, id)
+        .await
+        .map_err(|err| match err {
+            DeleteNoteError::NotFound => StatusCode::NOT_FOUND,
+            DeleteNoteError::Unknown(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::env;
-
     use axum::body::Body;
-    use http::Request;
+    use http::{Request, StatusCode};
     use http_body_util::BodyExt;
+    use oauth2::{AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl};
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
     use super::*;
-    use crate::domain::auth::Service as AuthServiceImpl;
-    use crate::domain::note::Service as NoteServiceImpl;
-    use crate::outbound::dynamodb::{DynamoNotes, DynamoSettings};
-    use crate::outbound::fake::FakeIdentity;
-    use crate::outbound::memory::{MemoryNotes, MemorySessions};
 
-    fn app<N>(notes: N) -> Router
-    where
-        N: NoteService,
-    {
-        HttpServer::new(
-            notes,
-            AuthServiceImpl::new(
-                FakeIdentity::new("csrf-1", "good-code", "user-1", "hayat"),
-                MemorySessions::new(),
-            ),
-            HttpServerConfig {
-                port: 0,
-                cookie_secure: false,
-            },
-        )
-        .router()
+    fn test_state() -> AppState {
+        let oauth_client = oauth2::basic::BasicClient::new(ClientId::new("cid".into()))
+            .set_client_secret(ClientSecret::new("secret".into()))
+            .set_auth_uri(
+                AuthUrl::new("https://q.trap.jp/api/v3/oauth2/authorize?response_type=code".into())
+                    .unwrap(),
+            )
+            .set_token_uri(TokenUrl::new("https://q.trap.jp/api/v3/oauth2/token".into()).unwrap())
+            .set_redirect_uri(
+                RedirectUrl::new("http://127.0.0.1:3000/auth/authorized".into()).unwrap(),
+            );
+        AppState {
+            store: MemoryStore::new(),
+            oauth_client,
+            notes: Service::new(MemoryNotes::new()),
+        }
     }
 
-    async fn response_json(response: Response) -> (StatusCode, HeaderMap, Value) {
-        let status = response.status();
-        let headers = response.headers().clone();
+    async fn login_cookie(state: &AppState, id: &str, name: &str) -> String {
+        let mut session = Session::new();
+        session
+            .insert(
+                "user",
+                &User {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                },
+            )
+            .unwrap();
+        let value = state.store.store_session(session).await.unwrap().unwrap();
+        format!("{COOKIE_NAME}={value}")
+    }
+
+    async fn json_body(response: Response) -> Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let value = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap()
-        };
-        (status, headers, value)
+        serde_json::from_slice(&bytes).unwrap()
     }
 
-    fn cookie_from(headers: &HeaderMap) -> String {
-        headers
-            .get(header::SET_COOKIE)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_string()
+    #[test]
+    fn authorize_url_points_at_traq() {
+        let (url, _) = test_state()
+            .oauth_client
+            .authorize_url(CsrfToken::new_random)
+            .add_scope(oauth2::Scope::new("read".to_string()))
+            .url();
+        let url = url.as_str();
+        assert!(url.starts_with("https://q.trap.jp/api/v3/oauth2/authorize?"));
+        assert!(url.contains("client_id=cid"));
+        assert!(url.contains("scope=read"));
     }
 
-    async fn login(app: &Router) -> String {
+    #[tokio::test]
+    async fn notes_redirect_until_login_and_stay_per_user() {
+        let state = test_state();
+        let app = app(state.clone());
+
         let response = app
             .clone()
-            .oneshot(Request::get("/auth/traq").body(Body::empty()).unwrap())
+            .oneshot(Request::get("/notes").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        let location = response
-            .headers()
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(location.contains("state=csrf-1"));
-        let csrf_cookie = cookie_from(response.headers());
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/auth/traq"
+        );
 
-        let response = app
+        let alice = login_cookie(&state, "alice", "alice").await;
+        let created = app
             .clone()
             .oneshot(
-                Request::get("/auth/authorized?code=good-code&state=csrf-1")
-                    .header(header::COOKIE, &csrf_cookie)
-                    .body(Body::empty())
+                Request::post("/notes")
+                    .header(header::COOKIE, &alice)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"  first memo  "}"#))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        cookie_from(response.headers())
-    }
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = json_body(created).await;
+        assert_eq!(created["text"], "first memo");
+        assert_eq!(created["completed"], false);
 
-    async fn write_and_read(app: Router) {
-        let (status, _, body) = response_json(
-            app.clone()
-                .oneshot(Request::get("/").body(Body::empty()).unwrap())
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, json!({ "user": null }));
-
-        let (status, _, body) = response_json(
-            app.clone()
-                .oneshot(Request::get("/notes").body(Body::empty()).unwrap())
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body["error"], "login required");
-
-        let session = login(&app).await;
-        let (status, _, body) = response_json(
-            app.clone()
-                .oneshot(
-                    Request::get("/")
-                        .header(header::COOKIE, &session)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["user"]["id"], "user-1");
-        assert_eq!(body["user"]["name"], "hayat");
-
-        let (status, _, existing) = response_json(
-            app.clone()
-                .oneshot(
-                    Request::get("/notes")
-                        .header(header::COOKIE, &session)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let before = existing["notes"].as_array().unwrap().len();
-
-        let (status, _, body) = response_json(
-            app.clone()
-                .oneshot(
-                    Request::post("/notes")
-                        .header(header::COOKIE, &session)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(r#"{"body":"  first memo  "}"#))
-                        .unwrap(),
-                )
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(body["body"], "first memo");
-
-        let (status, _, _) = response_json(
-            app.clone()
-                .oneshot(
-                    Request::post("/notes")
-                        .header(header::COOKIE, &session)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(r#"{"body":"   "}"#))
-                        .unwrap(),
-                )
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-
-        let (status, _, body) = response_json(
-            app.clone()
-                .oneshot(
-                    Request::get("/notes")
-                        .header(header::COOKIE, &session)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let notes = body["notes"].as_array().unwrap();
-        assert_eq!(notes.len(), before + 1);
-        assert_eq!(notes.last().unwrap()["body"], "first memo");
-
-        let response = app
+        let blank = app
             .clone()
             .oneshot(
-                Request::get("/logout")
-                    .header(header::COOKIE, &session)
-                    .body(Body::empty())
+                Request::post("/notes")
+                    .header(header::COOKIE, &alice)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"   "}"#))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(blank.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
-        let (status, _, _) = response_json(
-            app.oneshot(
+        let bob = login_cookie(&state, "bob", "bob").await;
+        let bobs = app
+            .clone()
+            .oneshot(
                 Request::get("/notes")
-                    .header(header::COOKIE, &session)
+                    .header(header::COOKIE, &bob)
                     .body(Body::empty())
                     .unwrap(),
             )
-            .await
-            .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn memory_notes_follow_the_login_flow() {
-        write_and_read(app(NoteServiceImpl::new(MemoryNotes::new()))).await;
-    }
-
-    #[tokio::test]
-    async fn mismatched_state_is_rejected() {
-        let app = app(NoteServiceImpl::new(MemoryNotes::new()));
-        let started = app
-            .clone()
-            .oneshot(Request::get("/auth/traq").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        let csrf_cookie = cookie_from(started.headers());
-        let (status, _, body) = response_json(
-            app.oneshot(
-                Request::get("/auth/authorized?code=good-code&state=nope")
-                    .header(header::COOKIE, csrf_cookie)
+        assert_eq!(json_body(bobs).await, json!([]));
+
+        let alices = app
+            .oneshot(
+                Request::get("/notes")
+                    .header(header::COOKIE, &alice)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
-            .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"], "login was rejected");
+            .unwrap();
+        let alices = json_body(alices).await;
+        assert_eq!(alices.as_array().unwrap().len(), 1);
+        assert_eq!(alices[0]["text"], "first memo");
     }
 
     #[tokio::test]
-    #[ignore = "needs MiniStack and the yarimashow-notes table"]
-    async fn ministack_notes_follow_the_login_flow() {
-        let endpoint = env::var("MINISTACK_ENDPOINT").expect("MINISTACK_ENDPOINT");
-        let repo = DynamoNotes::connect(&DynamoSettings {
-            region: "ap-northeast-1".to_string(),
-            table: "yarimashow-notes".to_string(),
-            endpoint: Some(endpoint),
-        })
-        .await
-        .unwrap();
-        write_and_read(app(NoteServiceImpl::new(repo))).await;
+    async fn csrf_mismatch_is_rejected() {
+        let state = test_state();
+        let mut session = Session::new();
+        session
+            .insert(CSRF_TOKEN, CsrfToken::new("expected".into()))
+            .unwrap();
+        let value = state.store.store_session(session).await.unwrap().unwrap();
+        let response = app(state)
+            .oneshot(
+                Request::get("/auth/authorized?code=nope&state=other")
+                    .header(header::COOKIE, format!("{COOKIE_NAME}={value}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
