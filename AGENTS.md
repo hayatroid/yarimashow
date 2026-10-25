@@ -18,3 +18,7 @@
 - Domain-First / API-First で開発する
   - https://www.howtocodeit.com/guides/master-hexagonal-architecture-in-rust
 - [Prove It Works](https://github.com/cursor/plugins/blob/main/pstack/skills/principle-prove-it-works/SKILL.md) し続ける
+
+## Cursor Cloud specific instructions
+
+Terraform は `infra/`。実 AWS に当てる前に MiniStack（`http://127.0.0.1:4566`）へ `./scripts/verify-infra.sh` を流す。接続先は `infra/ministack.tfvars`。ここでの認証情報は MiniStack 用の `test` / `test` であり、実 AWS の秘密情報は Cursor の Secrets に置く。

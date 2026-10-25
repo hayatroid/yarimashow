@@ -1,0 +1,5 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+.venv/
+.venv-probe/
